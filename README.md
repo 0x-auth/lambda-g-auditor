@@ -1,8 +1,10 @@
 # Lambda-G Auditor
 
-**Free tool to find how much your K8s cluster is wasting on stranded resources.**
+**Free 6D resource imbalance scanner for Kubernetes.**
 
-Most Kubernetes clusters waste 10-20% of compute budget on nodes where one resource is maxed out while another sits idle. This tool shows you exactly where.
+Scans your cluster across 6 dimensions — CPU, RAM, GPU Core, GPU Memory, IOPS, Network — and finds nodes where resources are stranded.
+
+Most clusters waste 10-20% of compute budget this way. GPU clusters waste even more — VRAM full but compute idle, or compute maxed but VRAM unused.
 
 ## Quick Start (30 seconds)
 
@@ -10,7 +12,8 @@ Most Kubernetes clusters waste 10-20% of compute budget on nodes where one resou
 git clone https://github.com/0x-auth/lambda-g-auditor
 cd lambda-g-auditor
 pip install kubernetes colorama
-python3 auditor.py
+python3 auditor.py           # CPU + RAM scan
+python3 auditor.py --gpu     # Include GPU metrics (Koordinator)
 ```
 
 That's it. Connects to your current kubectl context and scans every node.
@@ -18,20 +21,32 @@ That's it. Connects to your current kubectl context and scans every node.
 ## What It Shows
 
 ```
-🔍 [Lambda-G] Scanning for Entropic Leaks...
+🔍 [Lambda-G] 6D Resource Imbalance Scanner
+   φ = 1.618033988749895
+   GPU scanning: ON (koordinator.sh/gpu-core, gpu-memory)
 
-Node Name            | CPU %    | RAM %    | Status
-----------------------------------------------------------------------
-node-01              |   92.3%  |   18.7%  | Leaking (Mismatch)
-node-02              |   45.1%  |   51.2%  | Balanced
-node-03              |   88.9%  |   22.4%  | Leaking (Mismatch)
-node-04              |   31.6%  |   89.1%  | Leaking (Mismatch)
-----------------------------------------------------------------------
+Node                 | CPU%   | RAM%   | GPU%   | VRAM%  | Status
+---------------------------------------------------------------------------
+gpu-node-01          |  92.3% |  18.7% |  10.2% |  95.0% | CRITICAL: CPU stranded (VRAM maxed)
+gpu-node-02          |  45.1% |  51.2% |  80.0% |  75.3% | Balanced
+cpu-node-03          |  88.9% |  22.4% |    n/a |    n/a | Leaking: RAM stranded (CPU maxed)
+cpu-node-04          |  31.6% |  89.1% |    n/a |    n/a | Leaking: CPU stranded (RAM maxed)
+---------------------------------------------------------------------------
 
-💰 Potential Monthly Recovery: $2,847.00
+💰 Estimated Monthly Waste: $4,247.00
+
+📊 Cluster Summary:
+   Nodes: 4
+   CPU: 12.8/16.0 cores (80.0%)
+   RAM: 28.4/64.0 GB (44.4%)
+   GPU Nodes: 2
+   Imbalanced: 3/4 nodes
 ```
 
-**"Leaking"** = one resource dimension is >90% used while another is <60%. You're paying for the idle resource. Nobody can use it because the other dimension is full.
+**"CRITICAL"** = >60% imbalance between any two dimensions.
+**"Leaking"** = >30% imbalance. You're paying for idle resources.
+
+Now detects GPU imbalance: VRAM full but compute idle (common in LLM inference), or compute maxed but VRAM unused.
 
 ## Run the Benchmark
 
