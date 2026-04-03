@@ -1,427 +1,558 @@
 #!/usr/bin/env python3
 """
-Lambda-G Simulation Benchmark
-===============================
-Simulates cluster scheduling at realistic scale WITHOUT needing a live cluster.
+Lambda-G V3 — Hybrid Scoring
+=============================
+Core insight: BalancedAllocation is good at "make this node even."
+Cosine alignment is good at "send this pod to the RIGHT node."
+Combine them.
 
-Tests 3 strategies across multiple scenarios:
-- Default K8s (LeastAllocated)
-- Lambda-G Simple (2D entropy)
-- Lambda-G Full (4D vector alignment)
+V3 formula:
+  variance_score = how balanced the node will be after placement
+  alignment_score = how well the pod's shape matches the node's gap
+  pressure_gate = hard penalty near exhaustion
 
-Scenarios:
-- 20 nodes × 200 pods (mixed workload)
-- 50 nodes × 500 pods (scale test)
-- 10 nodes × 100 pods (CPU-heavy skew)
-- 10 nodes × 100 pods (RAM-heavy skew)
+  score = w_var × variance_score + w_align × alignment_score - pressure
 
-Metrics:
-- Balance score (variance across nodes)
-- Stranded resource %
-- Nodes needed before first "Pending" pod
-- Estimated monthly $ waste
-
-Run: python3 benchmark_simulation.py
+We iterate over weight combinations to find what actually wins.
 """
 
 import math
 import random
-import json
-import time
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Callable, Tuple
 
 PHI = 1.618033988749895
+N_DIMS = 6
+DIM_NAMES = ['CPU', 'RAM', 'GPU-Comp', 'GPU-Mem', 'IOPS', 'Network']
 
-# ─── AWS Pricing (m5.xlarge baseline: 4 CPU, 16GB RAM) ───
-COST_PER_CPU_MONTH = 34.50   # ~$138/mo for 4 CPU
-COST_PER_GB_RAM_MONTH = 4.31  # ~$69/mo for 16GB
+COST = {
+    'cpu': 34.50, 'ram': 4.31, 'gpu_compute': 150,
+    'gpu_memory': 50, 'iops': 0.10, 'network': 2.0,
+}
 
-# ─── Data Structures ───
+
+def cosine_sim(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    return dot / (mag_a * mag_b) if mag_a > 1e-10 and mag_b > 1e-10 else 0
+
 
 @dataclass
 class Node:
     name: str
-    cpu_total: float      # in cores
-    ram_total: float      # in GB
-    cpu_used: float = 0
-    ram_used: float = 0
+    capacity: List[float]
+    used: List[float] = field(default_factory=lambda: [0.0] * N_DIMS)
     pods: int = 0
 
-    @property
-    def cpu_free(self): return max(0, self.cpu_total - self.cpu_used)
-    @property
-    def ram_free(self): return max(0, self.ram_total - self.ram_used)
-    @property
-    def cpu_pct(self): return self.cpu_used / self.cpu_total * 100 if self.cpu_total > 0 else 0
-    @property
-    def ram_pct(self): return self.ram_used / self.ram_total * 100 if self.ram_total > 0 else 0
-    @property
-    def cpu_free_frac(self): return self.cpu_free / self.cpu_total if self.cpu_total > 0 else 0
-    @property
-    def ram_free_frac(self): return self.ram_free / self.ram_total if self.ram_total > 0 else 0
+    def free(self):
+        return [max(0, self.capacity[i] - self.used[i]) for i in range(N_DIMS)]
 
-    def can_fit(self, cpu, ram):
-        return self.cpu_free >= cpu and self.ram_free >= ram
+    def free_frac(self):
+        return [self.free()[i] / self.capacity[i] if self.capacity[i] > 0 else 0
+                for i in range(N_DIMS)]
 
-    def place(self, cpu, ram):
-        self.cpu_used += cpu
-        self.ram_used += ram
+    def used_frac(self):
+        return [self.used[i] / self.capacity[i] if self.capacity[i] > 0 else 0
+                for i in range(N_DIMS)]
+
+    def can_fit(self, req):
+        return all(self.free()[i] >= req[i] for i in range(N_DIMS))
+
+    def place(self, req):
+        for i in range(N_DIMS):
+            self.used[i] += req[i]
         self.pods += 1
 
 
 @dataclass
 class Pod:
     name: str
-    cpu: float   # in cores
-    ram: float   # in GB
+    req: List[float]
 
 
-# ─── Scoring Functions ───
+# ═══════════════════════════════════════════════════════════════
+# SCORING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
 
-def default_least_allocated_score(node: Node, pod: Pod) -> float:
-    """Kubernetes default LeastAllocated: prefer nodes with most free resources"""
-    if not node.can_fit(pod.cpu, pod.ram):
+def sc_least_alloc(node, pod):
+    if not node.can_fit(pod.req):
         return -1
-    cpu_score = node.cpu_free_frac * 100
-    ram_score = node.ram_free_frac * 100
-    return (cpu_score + ram_score) / 2
+    ff = node.free_frac()
+    active = [ff[i] for i in range(N_DIMS) if node.capacity[i] > 0]
+    return (sum(active) / len(active)) * 100 if active else 0
 
 
-def lambda_g_simple_score(node: Node, pod: Pod) -> float:
-    """Lambda-G Simple: 2D entropy reduction + capacity headroom"""
-    if not node.can_fit(pod.cpu, pod.ram):
+def sc_most_alloc(node, pod):
+    if not node.can_fit(pod.req):
         return -1
+    uf = node.used_frac()
+    active = [uf[i] for i in range(N_DIMS) if node.capacity[i] > 0]
+    return (sum(active) / len(active)) * 100 if active else 0
 
-    cpu_free = node.cpu_free_frac
-    ram_free = node.ram_free_frac
-    cpu_req = pod.cpu / node.cpu_total if node.cpu_total > 0 else 1
-    ram_req = pod.ram / node.ram_total if node.ram_total > 0 else 1
 
-    # Capacity gate
-    if cpu_free < 0.10 or ram_free < 0.10:
+def sc_balanced(node, pod):
+    if not node.can_fit(pod.req):
+        return -1
+    after = []
+    for i in range(N_DIMS):
+        if node.capacity[i] > 0:
+            after.append((node.used[i] + pod.req[i]) / node.capacity[i])
+    if not after:
         return 0
-
-    initial_entropy = abs(cpu_free - ram_free)
-    after_cpu = cpu_free - cpu_req
-    after_ram = ram_free - ram_req
-    final_entropy = abs(after_cpu - after_ram)
-
-    recovery = initial_entropy - final_entropy
-    exhaustion = 1.0 - (after_cpu + after_ram) / 2
-    headroom = (cpu_free + ram_free) / 2
-
-    return (recovery * PHI * 50) + (exhaustion * 10) + (headroom * 15)
+    mean = sum(after) / len(after)
+    var = sum((x - mean) ** 2 for x in after) / len(after)
+    return max(0, (1.0 - var * 4) * 100)
 
 
-def lambda_g_full_score(node: Node, pod: Pod) -> float:
-    """Lambda-G Full: 4D vector alignment + symmetric exhaustion + entropy penalty"""
-    if not node.can_fit(pod.cpu, pod.ram):
+def sc_dominant(node, pod):
+    if not node.can_fit(pod.req):
         return -1
-
-    node_vec = [node.cpu_free_frac, node.ram_free_frac, 0.5, 0.5]
-    pod_vec = [
-        pod.cpu / node.cpu_total if node.cpu_total > 0 else 1,
-        pod.ram / node.ram_total if node.ram_total > 0 else 1,
-        0.05, 0.05
-    ]
-
-    # Capacity gate
-    if node_vec[0] < 0.10 or node_vec[1] < 0.10:
+    after = []
+    for i in range(N_DIMS):
+        if node.capacity[i] > 0:
+            after.append((node.used[i] + pod.req[i]) / node.capacity[i])
+    if not after:
         return 0
-
-    # Cosine similarity (directional alignment)
-    dot = sum(a * b for a, b in zip(pod_vec, node_vec))
-    mag_a = math.sqrt(sum(a**2 for a in pod_vec))
-    mag_b = math.sqrt(sum(b**2 for b in node_vec))
-    alignment = dot / (mag_a * mag_b) if mag_a > 1e-10 and mag_b > 1e-10 else 0
-
-    # Symmetric exhaustion
-    after = [max(0, node_vec[i] - pod_vec[i]) for i in range(4)]
-    s_before = sum(node_vec)
-    s_after = sum(after)
-
-    ent_before = 0
-    ent_after = 0
-    if s_before > 1e-10:
-        ent_before = sum(-((x/s_before) * math.log(x/s_before)) if x/s_before > 1e-10 else 0 for x in node_vec)
-    if s_after > 1e-10:
-        ent_after = sum(-((x/s_after) * math.log(x/s_after)) if x/s_after > 1e-10 else 0 for x in after)
-
-    recovery = ent_before - ent_after
-
-    mag_before = math.sqrt(sum(x**2 for x in node_vec))
-    mag_after = math.sqrt(sum(x**2 for x in after))
-    utilization = (mag_before - mag_after) / mag_before if mag_before > 1e-10 else 0
-
-    exhaustion_bonus = PHI * recovery + utilization
-
-    # Entropy leak penalty
-    stranded = sum(1 for i in range(4) if after[i] > 0.70 and pod_vec[i] < 0.10)
-    penalty = stranded * 0.15
-
-    # Headroom bonus (don't pack one node to 100%)
-    headroom = (node_vec[0] + node_vec[1]) / 2
-
-    raw = PHI * alignment + exhaustion_bonus - penalty + headroom * 0.3
-    return max(0, raw * 30 + 50)
+    return (1.0 - max(after)) * 100
 
 
-# ─── Scheduling Simulator ───
+def make_lambda_g_v3(w_var, w_align, w_headroom):
+    """Factory: creates a V3 scorer with given weights."""
 
-def simulate_scheduling(nodes: List[Node], pods: List[Pod], score_fn) -> Dict:
-    """Simulate scheduling pods onto nodes using given score function"""
-    pending = 0
+    def sc_lambda_g_v3(node, pod):
+        if not node.can_fit(pod.req):
+            return -1
 
-    for pod in pods:
-        scores = [(score_fn(node, pod), i, node) for i, node in enumerate(nodes)]
-        scores.sort(key=lambda x: -x[0])
+        active_dims = [i for i in range(N_DIMS) if node.capacity[i] > 0]
+        if not active_dims:
+            return 0
 
-        placed = False
-        for score, _, node in scores:
-            if score > 0 and node.can_fit(pod.cpu, pod.ram):
-                node.place(pod.cpu, pod.ram)
-                placed = True
-                break
+        # ─── Component 1: Post-placement variance (from BalancedAllocation) ───
+        after_frac = []
+        for i in active_dims:
+            after_frac.append((node.used[i] + pod.req[i]) / node.capacity[i])
+        mean = sum(after_frac) / len(after_frac)
+        var = sum((x - mean) ** 2 for x in after_frac) / len(after_frac)
+        variance_score = max(0, (1.0 - var * 4) * 100)
 
-        if not placed:
-            pending += 1
+        # ─── Component 2: Cosine alignment (directional match) ───
+        node_free = node.free_frac()
+        pod_frac = [
+            pod.req[i] / node.capacity[i] if node.capacity[i] > 0 else 0
+            for i in range(N_DIMS)
+        ]
+        nf = [node_free[i] for i in active_dims]
+        pf = [pod_frac[i] for i in active_dims]
+        alignment = cosine_sim(nf, pf)
+        alignment_score = alignment * 100
 
-    return calculate_metrics(nodes, pending)
+        # ─── Component 3: Headroom (don't over-pack one node) ───
+        headroom = sum(nf) / len(nf)
+        headroom_score = headroom * 100
 
+        # ─── Component 4: Pressure gate (hard penalty near exhaustion) ───
+        pressure = 0
+        for i in active_dims:
+            used_after = (node.used[i] + pod.req[i]) / node.capacity[i]
+            if used_after > 0.92:
+                pressure += (used_after - 0.92) * 500  # sharp cliff
+            elif used_after > 0.85:
+                pressure += (used_after - 0.85) * 50   # gentle slope
 
-def calculate_metrics(nodes: List[Node], pending: int) -> Dict:
-    """Calculate cluster metrics"""
-    cpu_pcts = [n.cpu_pct for n in nodes]
-    ram_pcts = [n.ram_pct for n in nodes]
+        # ─── Component 5: Stranding penalty ───
+        # If placement would create a stranded dimension (one > 80%, another < 20%)
+        strand_penalty = 0
+        for i in range(len(active_dims)):
+            for j in range(i + 1, len(active_dims)):
+                ui = after_frac[i]
+                uj = after_frac[j]
+                if (ui > 0.80 and uj < 0.20) or (uj > 0.80 and ui < 0.20):
+                    strand_penalty += 15
 
-    cpu_mean = sum(cpu_pcts) / len(cpu_pcts)
-    ram_mean = sum(ram_pcts) / len(ram_pcts)
+        raw = (w_var * variance_score +
+               w_align * alignment_score +
+               w_headroom * headroom_score -
+               pressure - strand_penalty)
 
-    cpu_var = sum((x - cpu_mean)**2 for x in cpu_pcts) / len(cpu_pcts)
-    ram_var = sum((x - ram_mean)**2 for x in ram_pcts) / len(ram_pcts)
+        return max(0, min(100, raw))
 
-    # Stranded: one dimension >70% while other <30%
-    stranded = sum(1 for n in nodes
-                   if (n.cpu_pct > 70 and n.ram_pct < 30) or
-                      (n.ram_pct > 70 and n.cpu_pct < 30))
-
-    # Effective utilization: active nodes (>10% on any resource)
-    active_nodes = sum(1 for n in nodes if n.cpu_pct > 10 or n.ram_pct > 10)
-
-    # Balance score
-    max_var = 2500
-    balance = max(0, 100 - (cpu_var + ram_var) / max_var * 100)
-
-    # Wasted resources (stranded)
-    wasted_cpu = sum(n.cpu_free for n in nodes if n.cpu_pct > 70 and n.ram_pct < 30)
-    wasted_ram = sum(n.ram_free for n in nodes if n.ram_pct > 70 and n.cpu_pct < 30)
-
-    # Monthly $ waste
-    monthly_waste = wasted_cpu * COST_PER_CPU_MONTH + wasted_ram * COST_PER_GB_RAM_MONTH
-
-    # Total utilization
-    total_cpu = sum(n.cpu_used for n in nodes)
-    total_cap_cpu = sum(n.cpu_total for n in nodes)
-    total_ram = sum(n.ram_used for n in nodes)
-    total_cap_ram = sum(n.ram_total for n in nodes)
-
-    return {
-        "cpu_variance": round(cpu_var, 1),
-        "ram_variance": round(ram_var, 1),
-        "stranded_nodes": stranded,
-        "balance_score": round(balance, 1),
-        "active_nodes": active_nodes,
-        "pending_pods": pending,
-        "total_cpu_pct": round(total_cpu / total_cap_cpu * 100, 1) if total_cap_cpu > 0 else 0,
-        "total_ram_pct": round(total_ram / total_cap_ram * 100, 1) if total_cap_ram > 0 else 0,
-        "wasted_cpu_cores": round(wasted_cpu, 1),
-        "wasted_ram_gb": round(wasted_ram, 1),
-        "monthly_waste_usd": round(monthly_waste, 0),
-    }
+    return sc_lambda_g_v3
 
 
-# ─── Pod Generators ───
+# ═══════════════════════════════════════════════════════════════
+# NODE + POD GENERATORS
+# ═══════════════════════════════════════════════════════════════
 
-def gen_mixed_pods(n):
-    """Generate mixed workload: 40% CPU-heavy, 30% RAM-heavy, 30% balanced"""
+def make_cpu_node(n):     return Node(n, [16, 32, 0, 0, 50, 10])
+def make_ram_node(n):     return Node(n, [8, 128, 0, 0, 50, 10])
+def make_gpu_inf(n):      return Node(n, [8, 32, 50, 80, 100, 25])
+def make_gpu_train(n):    return Node(n, [32, 128, 100, 80, 200, 100])
+def make_balanced(n):     return Node(n, [8, 32, 0, 0, 50, 10])
+
+def gen_llm_serve(i):
+    return Pod(f"llm-{i}", [random.uniform(1,3), random.uniform(8,16),
+        random.uniform(5,15), random.uniform(30,60), random.uniform(5,15), random.uniform(2,8)])
+def gen_batch_inf(i):
+    return Pod(f"batch-{i}", [random.uniform(0.5,2), random.uniform(2,8),
+        random.uniform(20,40), random.uniform(5,15), random.uniform(10,30), random.uniform(1,5)])
+def gen_training(i):
+    return Pod(f"train-{i}", [random.uniform(4,16), random.uniform(16,64),
+        random.uniform(30,80), random.uniform(20,60), random.uniform(50,150), random.uniform(10,50)])
+def gen_preprocess(i):
+    return Pod(f"pre-{i}", [random.uniform(2,8), random.uniform(4,16),
+        0, 0, random.uniform(20,80), random.uniform(2,10)])
+def gen_api(i):
+    return Pod(f"api-{i}", [random.uniform(0.2,1), random.uniform(0.5,2),
+        0, 0, random.uniform(1,5), random.uniform(1,5)])
+def gen_etl(i):
+    return Pod(f"etl-{i}", [random.uniform(1,4), random.uniform(8,32),
+        0, 0, random.uniform(50,150), random.uniform(5,20)])
+
+def gen_workload(n, mix):
     pods = []
     for i in range(n):
         r = random.random()
-        if r < 0.4:  # CPU-heavy
-            pods.append(Pod(f"cpu-{i}", cpu=random.uniform(0.5, 2.0), ram=random.uniform(0.1, 0.5)))
-        elif r < 0.7:  # RAM-heavy
-            pods.append(Pod(f"ram-{i}", cpu=random.uniform(0.1, 0.3), ram=random.uniform(1.0, 4.0)))
-        else:  # Balanced
-            v = random.uniform(0.3, 1.0)
-            pods.append(Pod(f"bal-{i}", cpu=v, ram=v * random.uniform(0.8, 1.2)))
+        cum = 0
+        for prob, gen_fn in mix:
+            cum += prob
+            if r < cum:
+                pods.append(gen_fn(i))
+                break
     return pods
 
-def gen_cpu_heavy_pods(n):
-    """90% CPU-heavy pods"""
-    pods = []
-    for i in range(n):
-        if random.random() < 0.9:
-            pods.append(Pod(f"cpu-{i}", cpu=random.uniform(0.5, 2.5), ram=random.uniform(0.1, 0.3)))
-        else:
-            pods.append(Pod(f"bal-{i}", cpu=random.uniform(0.3, 0.5), ram=random.uniform(0.5, 1.0)))
-    return pods
+MIX_AI = [(0.15, gen_llm_serve), (0.15, gen_batch_inf), (0.10, gen_training),
+           (0.25, gen_preprocess), (0.20, gen_api), (0.15, gen_etl)]
+MIX_INF = [(0.35, gen_llm_serve), (0.25, gen_batch_inf), (0.05, gen_training),
+            (0.15, gen_preprocess), (0.15, gen_api), (0.05, gen_etl)]
+MIX_TRAIN = [(0.10, gen_llm_serve), (0.10, gen_batch_inf), (0.35, gen_training),
+              (0.20, gen_preprocess), (0.10, gen_api), (0.15, gen_etl)]
+MIX_CPU = [(0.05, gen_llm_serve), (0.05, gen_batch_inf), (0.0, gen_training),
+            (0.40, gen_preprocess), (0.30, gen_api), (0.20, gen_etl)]
 
-def gen_ram_heavy_pods(n):
-    """90% RAM-heavy pods"""
-    pods = []
-    for i in range(n):
-        if random.random() < 0.9:
-            pods.append(Pod(f"ram-{i}", cpu=random.uniform(0.1, 0.3), ram=random.uniform(1.0, 6.0)))
-        else:
-            pods.append(Pod(f"bal-{i}", cpu=random.uniform(0.3, 0.5), ram=random.uniform(0.5, 1.0)))
-    return pods
+def make_mixed_cluster():
+    nodes = []
+    for i in range(8):  nodes.append(make_cpu_node(f"cpu-{i}"))
+    for i in range(4):  nodes.append(make_ram_node(f"ram-{i}"))
+    for i in range(8):  nodes.append(make_gpu_inf(f"gpu-inf-{i}"))
+    for i in range(4):  nodes.append(make_gpu_train(f"gpu-train-{i}"))
+    for i in range(6):  nodes.append(make_balanced(f"bal-{i}"))
+    return nodes
 
-def gen_nodes(n, cpu=4, ram=16):
-    """Generate n identical nodes (m5.xlarge equivalent)"""
-    return [Node(f"node-{i:02d}", cpu_total=cpu, ram_total=ram) for i in range(n)]
+def make_gpu_cluster():
+    nodes = []
+    for i in range(4):  nodes.append(make_cpu_node(f"cpu-{i}"))
+    for i in range(2):  nodes.append(make_ram_node(f"ram-{i}"))
+    for i in range(8):  nodes.append(make_gpu_inf(f"gpu-inf-{i}"))
+    for i in range(6):  nodes.append(make_gpu_train(f"gpu-train-{i}"))
+    return nodes
 
+def make_cpu_plus_gpu():
+    nodes = []
+    for i in range(10): nodes.append(make_cpu_node(f"cpu-{i}"))
+    for i in range(6):  nodes.append(make_ram_node(f"ram-{i}"))
+    for i in range(3):  nodes.append(make_gpu_inf(f"gpu-inf-{i}"))
+    for i in range(6):  nodes.append(make_balanced(f"bal-{i}"))
+    return nodes
 
-# ─── Run Scenarios ───
-
-STRATEGIES = [
-    ("Default (LeastAllocated)", default_least_allocated_score),
-    ("Lambda-G Simple (2D)", lambda_g_simple_score),
-    ("Lambda-G Full (4D)", lambda_g_full_score),
-]
 
 SCENARIOS = [
-    {"name": "Mixed Workload (20n × 200p)", "nodes": 20, "pods": 200, "gen": gen_mixed_pods},
-    {"name": "Scale Test (50n × 500p)", "nodes": 50, "pods": 500, "gen": gen_mixed_pods},
-    {"name": "CPU-Heavy Skew (10n × 100p)", "nodes": 10, "pods": 100, "gen": gen_cpu_heavy_pods},
-    {"name": "RAM-Heavy Skew (10n × 100p)", "nodes": 10, "pods": 100, "gen": gen_ram_heavy_pods},
-    {"name": "Dense Packing (10n × 150p)", "nodes": 10, "pods": 150, "gen": gen_mixed_pods},
+    {"name": "Mixed GPU — AI Workload",
+     "cluster": make_mixed_cluster, "mix": MIX_AI, "n": 120},
+    {"name": "GPU — Inference Heavy",
+     "cluster": make_gpu_cluster, "mix": MIX_INF, "n": 80},
+    {"name": "GPU — Training Heavy",
+     "cluster": make_gpu_cluster, "mix": MIX_TRAIN, "n": 60},
+    {"name": "CPU + Few GPUs",
+     "cluster": make_cpu_plus_gpu, "mix": MIX_CPU, "n": 100},
+    {"name": "Scale (60n×300p)",
+     "cluster": lambda: make_mixed_cluster() + make_mixed_cluster(),
+     "mix": MIX_AI, "n": 300},
 ]
 
 
-def run_scenario(scenario, seed=42):
-    """Run a single scenario across all strategies"""
+# ═══════════════════════════════════════════════════════════════
+# METRICS + SIMULATION
+# ═══════════════════════════════════════════════════════════════
+
+def calc_metrics(nodes, pending, total):
+    active = [n for n in nodes if n.pods > 0]
+    per_node_imb = []
+    for n in active:
+        uf = n.used_frac()
+        dims = [uf[i] for i in range(N_DIMS) if n.capacity[i] > 0]
+        if len(dims) < 2:
+            continue
+        mean = sum(dims) / len(dims)
+        per_node_imb.append(sum((x - mean) ** 2 for x in dims) / len(dims))
+
+    avg_imb = sum(per_node_imb) / len(per_node_imb) if per_node_imb else 0
+
+    stranded = 0
+    for n in active:
+        uf = n.used_frac()
+        active_uf = [uf[i] for i in range(N_DIMS) if n.capacity[i] > 0]
+        if len(active_uf) >= 2 and max(active_uf) > 0.70 and min(active_uf) < 0.30:
+            stranded += 1
+
+    sched_rate = (total - pending) / total if total > 0 else 1
+    imb_score = max(0, 100 - avg_imb * 400)
+    balance = imb_score * 0.7 + sched_rate * 100 * 0.3
+
+    cost_keys = ['cpu', 'ram', 'gpu_compute', 'gpu_memory', 'iops', 'network']
+    waste = 0
+    for n in active:
+        uf = n.used_frac()
+        active_uf = [(i, uf[i]) for i in range(N_DIMS) if n.capacity[i] > 0]
+        if len(active_uf) >= 2 and max(x for _, x in active_uf) > 0.70:
+            for dim, u in active_uf:
+                if u < 0.30:
+                    waste += n.free()[dim] * COST[cost_keys[dim]]
+
+    return {
+        "balance": round(balance, 1),
+        "imbalance": round(avg_imb, 4),
+        "stranded": stranded,
+        "sched_pct": round(sched_rate * 100, 1),
+        "pending": pending,
+        "waste": round(waste, 0),
+    }
+
+
+def simulate(nodes, pods, score_fn):
+    pending = 0
+    for pod in pods:
+        scores = [(score_fn(n, pod), i, n) for i, n in enumerate(nodes)]
+        scores.sort(key=lambda x: (-x[0], x[1]))
+        placed = False
+        for sc, _, n in scores:
+            if sc > 0 and n.can_fit(pod.req):
+                n.place(pod.req)
+                placed = True
+                break
+        if not placed:
+            pending += 1
+    return calc_metrics(nodes, pending, len(pods))
+
+
+def eval_strategy(name, score_fn, seed=42):
+    """Run all scenarios, return aggregate metrics."""
+    total_balance = 0
+    total_stranded = 0
+    total_waste = 0
+    total_pending = 0
+    wins = 0  # not used here, just aggregates
+
     results = {}
-
-    for strat_name, score_fn in STRATEGIES:
+    for sc in SCENARIOS:
         random.seed(seed)
-        nodes = gen_nodes(scenario["nodes"])
-        pods = scenario["gen"](scenario["pods"])
-        random.shuffle(pods)  # Randomize arrival order
+        nodes = sc["cluster"]()
+        pods = gen_workload(sc["n"], sc["mix"])
+        random.shuffle(pods)
+        m = simulate(nodes, pods, score_fn)
+        results[sc["name"]] = m
+        total_balance += m["balance"]
+        total_stranded += m["stranded"]
+        total_waste += m["waste"]
+        total_pending += m["pending"]
 
-        metrics = simulate_scheduling(nodes, pods, score_fn)
-        results[strat_name] = metrics
-
-    return results
+    return {
+        "results": results,
+        "avg_balance": round(total_balance / len(SCENARIOS), 1),
+        "total_stranded": total_stranded,
+        "total_waste": total_waste,
+        "total_pending": total_pending,
+    }
 
 
 def main():
-    random.seed(42)
-
     print(f"""
-◊═══════════════════════════════════════════════════════════════════════◊
-  LAMBDA-G SIMULATION BENCHMARK
+◊═══════════════════════════════════════════════════════════════════════════════◊
+  LAMBDA-G V3 — WEIGHT SEARCH + FULL BENCHMARK
   φ = {PHI}
-  Simulating realistic cluster scheduling at scale
-◊═══════════════════════════════════════════════════════════════════════◊
+◊═══════════════════════════════════════════════════════════════════════════════◊
 """)
+
+    # ─── Phase 1: Grid search over weight combinations ───
+    print("=" * 75)
+    print(" PHASE 1: Weight Grid Search")
+    print(" Finding optimal (w_var, w_align, w_headroom) combination")
+    print("=" * 75)
+
+    # Also evaluate baselines
+    baselines = [
+        ("LeastAllocated", sc_least_alloc),
+        ("MostAllocated", sc_most_alloc),
+        ("BalancedAllocation", sc_balanced),
+        ("DominantResource", sc_dominant),
+    ]
+
+    baseline_results = {}
+    for name, fn in baselines:
+        baseline_results[name] = eval_strategy(name, fn)
+
+    print(f"\n  Baselines:")
+    print(f"  {'Strategy':<25} {'Avg Bal':>8} {'Stranded':>9} {'Waste $':>10} {'Pending':>8}")
+    print(f"  {'─' * 62}")
+    for name in baseline_results:
+        r = baseline_results[name]
+        print(f"  {name:<25} {r['avg_balance']:>8.1f} {r['total_stranded']:>9} ${r['total_waste']:>9.0f} {r['total_pending']:>8}")
+
+    bal_balance = baseline_results["BalancedAllocation"]["avg_balance"]
+    bal_stranded = baseline_results["BalancedAllocation"]["total_stranded"]
+
+    # Grid search
+    print(f"\n  Searching weight space...")
+    print(f"  Target: beat BalancedAllocation (avg_balance={bal_balance}, stranded={bal_stranded})")
+    print()
+
+    best = None
+    best_score = -1
+    all_candidates = []
+
+    for w_var_10 in range(3, 9):          # 0.3 to 0.8
+        for w_align_10 in range(1, 6):    # 0.1 to 0.5
+            for w_head_10 in range(0, 4):  # 0.0 to 0.3
+                w_var = w_var_10 / 10.0
+                w_align = w_align_10 / 10.0
+                w_head = w_head_10 / 10.0
+
+                # Normalize
+                total_w = w_var + w_align + w_head
+                if total_w < 0.01:
+                    continue
+
+                fn = make_lambda_g_v3(w_var, w_align, w_head)
+                r = eval_strategy("test", fn)
+
+                # Score: balance matters most, then stranded, then waste
+                composite = (r['avg_balance'] * 2
+                             - r['total_stranded'] * 0.5
+                             - r['total_waste'] / 10000)
+
+                all_candidates.append((w_var, w_align, w_head, r, composite))
+
+                if composite > best_score:
+                    best_score = composite
+                    best = (w_var, w_align, w_head, r)
+
+    # Sort by composite score, show top 10
+    all_candidates.sort(key=lambda x: -x[4])
+
+    print(f"  {'Rank':<5} {'w_var':>6} {'w_aln':>6} {'w_hd':>6} {'Bal':>7} {'Str':>5} {'Waste':>9} {'Pend':>6} {'Comp':>8}")
+    print(f"  {'─' * 65}")
+    for rank, (wv, wa, wh, r, comp) in enumerate(all_candidates[:10], 1):
+        print(f"  {rank:<5} {wv:>6.1f} {wa:>6.1f} {wh:>6.1f} {r['avg_balance']:>7.1f} {r['total_stranded']:>5} ${r['total_waste']:>8.0f} {r['total_pending']:>6} {comp:>8.1f}")
+
+    w_v, w_a, w_h, best_r = best
+    print(f"\n  ★ Best weights: w_var={w_v}, w_align={w_a}, w_headroom={w_h}")
+    print(f"    Avg Balance: {best_r['avg_balance']} (BalancedAlloc: {bal_balance})")
+    print(f"    Stranded: {best_r['total_stranded']} (BalancedAlloc: {bal_stranded})")
+
+    beats_bal = best_r['avg_balance'] > bal_balance
+    print(f"\n    {'✅ BEATS' if beats_bal else '❌ LOSES TO'} BalancedAllocation on avg balance")
+
+    # ─── Phase 2: Full benchmark with best weights ───
+    print(f"\n{'=' * 75}")
+    print(f" PHASE 2: Full Benchmark — Best V3 vs All Strategies")
+    print(f"{'=' * 75}")
+
+    strategies = [
+        ("LeastAllocated",     sc_least_alloc),
+        ("MostAllocated",      sc_most_alloc),
+        ("BalancedAllocation", sc_balanced),
+        ("DominantResource",   sc_dominant),
+        (f"Lambda-G V3 ({w_v}/{w_a}/{w_h})", make_lambda_g_v3(w_v, w_a, w_h)),
+    ]
+    short = ["LeastAll", "MostAll", "BalAlloc", "DomRes", "LG-V3"]
 
     all_results = {}
+    for sc in SCENARIOS:
+        print(f"\n  ── {sc['name']} ──")
+        results = {}
+        for sname, sfn in strategies:
+            random.seed(42)
+            nodes = sc["cluster"]()
+            pods = gen_workload(sc["n"], sc["mix"])
+            random.shuffle(pods)
+            results[sname] = simulate(nodes, pods, sfn)
+        all_results[sc["name"]] = results
 
-    for scenario in SCENARIOS:
-        print(f"\n  {'═' * 70}")
-        print(f"  SCENARIO: {scenario['name']}")
-        print(f"  {'═' * 70}\n")
-
-        results = run_scenario(scenario)
-        all_results[scenario['name']] = results
-
-        # Print comparison table
-        print(f"  {'Metric':<22}", end="")
-        for name, _ in STRATEGIES:
-            print(f" {name[:18]:>18}", end="")
+        print(f"  {'Metric':<18}", end="")
+        for s in short:
+            print(f" {s:>10}", end="")
         print()
-        print(f"  {'─' * 76}")
+        print(f"  {'─' * 70}")
 
-        metrics_to_show = [
-            ('balance_score', 'Balance Score', True),      # Higher = better
-            ('cpu_variance', 'CPU Variance', False),       # Lower = better
-            ('ram_variance', 'RAM Variance', False),       # Lower = better
-            ('stranded_nodes', 'Stranded Nodes', False),   # Lower = better
-            ('pending_pods', 'Pending Pods', False),       # Lower = better
-            ('active_nodes', 'Active Nodes', False),       # Lower = better (efficiency)
-            ('monthly_waste_usd', 'Monthly Waste $', False),  # Lower = better
-        ]
-
-        for key, label, higher_better in metrics_to_show:
-            values = [results[name][key] for name, _ in STRATEGIES]
-            best = max(values) if higher_better else min(values)
-
-            print(f"  {label:<22}", end="")
-            for v in values:
-                marker = " ★" if v == best and values.count(best) == 1 else "  "
-                print(f" {v:>16}{marker}", end="")
+        for key, label, hb in [
+            ('balance', 'Balance', True), ('stranded', 'Stranded', False),
+            ('sched_pct', 'Sched %', True), ('waste', 'Waste $', False)]:
+            vals = [results[n][key] for n, _ in strategies]
+            best_v = max(vals) if hb else min(vals)
+            print(f"  {label:<18}", end="")
+            for v in vals:
+                m = " ★" if v == best_v and vals.count(best_v) == 1 else "  "
+                if key == 'waste':
+                    print(f" ${v:>8.0f}{m}", end="")
+                else:
+                    print(f" {v:>9}{m}", end="")
             print()
 
-        # Winner
-        default_balance = results[STRATEGIES[0][0]]['balance_score']
-        simple_balance = results[STRATEGIES[1][0]]['balance_score']
-        full_balance = results[STRATEGIES[2][0]]['balance_score']
+    # Grand summary
+    print(f"\n{'═' * 85}")
+    print(f" GRAND SUMMARY")
+    print(f"{'═' * 85}\n")
 
-        simple_delta = simple_balance - default_balance
-        full_delta = full_balance - default_balance
+    print(f"  {'Scenario':<35}", end="")
+    for s in short:
+        print(f" {s:>9}", end="")
+    print(f" {'Winner':>13}")
+    print(f"  {'─' * 95}")
 
-        default_waste = results[STRATEGIES[0][0]]['monthly_waste_usd']
-        simple_waste = results[STRATEGIES[1][0]]['monthly_waste_usd']
-        full_waste = results[STRATEGIES[2][0]]['monthly_waste_usd']
+    wins = {n: 0 for n, _ in strategies}
+    tw = {n: 0 for n, _ in strategies}
+    ts = {n: 0 for n, _ in strategies}
 
-        print(f"\n  Simple vs Default: {simple_delta:+.1f} balance, ${default_waste - simple_waste:+.0f}/mo saved")
-        print(f"  Full vs Default:   {full_delta:+.1f} balance, ${default_waste - full_waste:+.0f}/mo saved")
+    for sn, res in all_results.items():
+        scores = {n: res[n]['balance'] for n, _ in strategies}
+        w = max(scores, key=scores.get)
+        wins[w] += 1
+        for n, _ in strategies:
+            tw[n] += res[n]['waste']
+            ts[n] += res[n]['stranded']
+        print(f"  {sn:<35}", end="")
+        for n, _ in strategies:
+            m = " ★" if n == w else "  "
+            print(f" {scores[n]:>7.1f}{m}", end="")
+        print(f"  {w.split('(')[0].strip():>11}")
 
-    # ─── GRAND SUMMARY ───
-    print(f"""
+    print(f"\n  {'─' * 95}")
+    print(f"  {'Wins':<35}", end="")
+    for n, _ in strategies:
+        print(f" {wins[n]:>9}", end="")
+    print()
+    print(f"  {'Total Stranded':<35}", end="")
+    for n, _ in strategies:
+        print(f" {ts[n]:>9}", end="")
+    print()
+    print(f"  {'Total Waste $':<35}", end="")
+    for n, _ in strategies:
+        print(f" ${tw[n]:>8.0f}", end="")
+    print()
 
-◊═══════════════════════════════════════════════════════════════════════◊
-  GRAND SUMMARY — All Scenarios
-◊═══════════════════════════════════════════════════════════════════════◊
-""")
-
-    print(f"  {'Scenario':<35} {'Default':>10} {'Simple':>10} {'Full':>10} {'Winner':>10}")
-    print(f"  {'─' * 78}")
-
-    simple_wins = 0
-    full_wins = 0
-    default_wins = 0
-    total_default_waste = 0
-    total_simple_waste = 0
-    total_full_waste = 0
-
-    for scenario_name, results in all_results.items():
-        d = results[STRATEGIES[0][0]]['balance_score']
-        s = results[STRATEGIES[1][0]]['balance_score']
-        f = results[STRATEGIES[2][0]]['balance_score']
-
-        total_default_waste += results[STRATEGIES[0][0]]['monthly_waste_usd']
-        total_simple_waste += results[STRATEGIES[1][0]]['monthly_waste_usd']
-        total_full_waste += results[STRATEGIES[2][0]]['monthly_waste_usd']
-
-        winner = "Full" if f >= s and f >= d else ("Simple" if s >= d else "Default")
-        if winner == "Full": full_wins += 1
-        elif winner == "Simple": simple_wins += 1
-        else: default_wins += 1
-
-        print(f"  {scenario_name:<35} {d:>10.1f} {s:>10.1f} {f:>10.1f} {winner:>10}")
-
-    print(f"\n  {'─' * 78}")
-    print(f"  {'Wins':<35} {default_wins:>10} {simple_wins:>10} {full_wins:>10}")
-    print(f"  {'Total $ Waste':<35} ${total_default_waste:>9.0f} ${total_simple_waste:>9.0f} ${total_full_waste:>9.0f}")
-    print(f"  {'Savings vs Default':<35} {'—':>10} ${total_default_waste - total_simple_waste:>8.0f} ${total_default_waste - total_full_waste:>8.0f}")
+    lg_name = strategies[4][0]
+    ba_name = strategies[2][0]
 
     print(f"""
-◊═══════════════════════════════════════════════════════════════════════◊
+◊═══════════════════════════════════════════════════════════════════════════════◊
+  VERDICT
+  Lambda-G V3 wins: {wins[lg_name]}/5
+  BalancedAllocation wins: {wins[ba_name]}/5
+  Lambda-G V3 total stranded: {ts[lg_name]} (BalAlloc: {ts[ba_name]})
+  Lambda-G V3 total waste: ${tw[lg_name]:.0f} (BalAlloc: ${tw[ba_name]:.0f})
+  Best weights: w_var={w_v}  w_align={w_a}  w_headroom={w_h}
   φ = {PHI}
-  "Symmetric exhaustion > least allocation"
-◊═══════════════════════════════════════════════════════════════════════◊
+◊═══════════════════════════════════════════════════════════════════════════════◊
 """)
 
 

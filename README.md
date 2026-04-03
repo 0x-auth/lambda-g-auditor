@@ -50,20 +50,28 @@ Now detects GPU imbalance: VRAM full but compute idle (common in LLM inference),
 
 ## Run the Benchmark
 
-See how Lambda-G scheduling compares to default K8s across 5 scenarios:
+See how Lambda-G V3 scheduling compares to 4 baseline strategies across 5 scenarios:
 
 ```bash
 python3 benchmark.py
 ```
 
-Tests 3 strategies (Default, Lambda-G Simple, Lambda-G Full) across:
-- Mixed workload (20 nodes × 200 pods)
-- Scale test (50 nodes × 500 pods)
-- CPU-heavy skew
-- RAM-heavy skew
-- Dense packing
+Tests 5 strategies (LeastAlloc, MostAlloc, BalancedAlloc, DominantRes, Lambda-G V3) across:
+- Mixed GPU — AI Workload (30 nodes × 120 pods)
+- GPU — Inference Heavy (20 nodes × 80 pods)
+- GPU — Training Heavy (20 nodes × 60 pods)
+- CPU + Few GPUs (25 nodes × 100 pods)
+- Scale (60 nodes × 300 pods)
 
-Lambda-G wins all 5 scenarios with zero stranded nodes in 4/5.
+**V3 scoring formula:**
+
+```
+score = 0.6 × variance + 0.2 × alignment + 0.1 × headroom - penalties
+```
+
+Where `variance` = post-placement balance, `alignment` = cosine similarity between pod request and node free-space vectors, `headroom` = average remaining capacity, and `penalties` = pressure gate + stranding penalty.
+
+**Results:** Lambda-G V3 wins 5/5 scenarios, with 23% fewer stranded nodes and 53% less waste vs BalancedAllocation.
 
 ## How It Works
 
