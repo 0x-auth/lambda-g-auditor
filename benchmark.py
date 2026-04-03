@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Lambda-G V3 — Hybrid Scoring
-=============================
-Core insight: BalancedAllocation is good at "make this node even."
-Cosine alignment is good at "send this pod to the RIGHT node."
-Combine them.
+Cluster Scheduling Baseline Comparison
+=======================================
+Compare 4 built-in Kubernetes scheduling strategies across realistic
+6-dimensional workloads (CPU, RAM, GPU-Compute, GPU-Memory, IOPS, Network).
 
-V3 formula:
-  variance_score = how balanced the node will be after placement
-  alignment_score = how well the pod's shape matches the node's gap
-  pressure_gate = hard penalty near exhaustion
+Strategies tested:
+  - LeastAllocated   (spread pods across nodes)
+  - MostAllocated    (bin-pack onto fewest nodes)
+  - BalancedAllocation (minimize per-node variance)
+  - DominantResource  (minimize bottleneck dimension)
 
-  score = w_var × variance_score + w_align × alignment_score - pressure
-
-We iterate over weight combinations to find what actually wins.
+For Lambda-G scoring results, see the design proposals at:
+  https://github.com/kai-scheduler/KAI-Scheduler/pull/1374
 """
 
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Callable, Tuple
+from typing import List, Callable
 
 PHI = 1.618033988749895
 N_DIMS = 6
@@ -29,13 +28,6 @@ COST = {
     'cpu': 34.50, 'ram': 4.31, 'gpu_compute': 150,
     'gpu_memory': 50, 'iops': 0.10, 'network': 2.0,
 }
-
-
-def cosine_sim(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    return dot / (mag_a * mag_b) if mag_a > 1e-10 and mag_b > 1e-10 else 0
 
 
 @dataclass
@@ -72,7 +64,7 @@ class Pod:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SCORING FUNCTIONS
+# SCORING FUNCTIONS (4 built-in K8s strategies)
 # ═══════════════════════════════════════════════════════════════
 
 def sc_least_alloc(node, pod):
@@ -115,69 +107,6 @@ def sc_dominant(node, pod):
     if not after:
         return 0
     return (1.0 - max(after)) * 100
-
-
-def make_lambda_g_v3(w_var, w_align, w_headroom):
-    """Factory: creates a V3 scorer with given weights."""
-
-    def sc_lambda_g_v3(node, pod):
-        if not node.can_fit(pod.req):
-            return -1
-
-        active_dims = [i for i in range(N_DIMS) if node.capacity[i] > 0]
-        if not active_dims:
-            return 0
-
-        # ─── Component 1: Post-placement variance (from BalancedAllocation) ───
-        after_frac = []
-        for i in active_dims:
-            after_frac.append((node.used[i] + pod.req[i]) / node.capacity[i])
-        mean = sum(after_frac) / len(after_frac)
-        var = sum((x - mean) ** 2 for x in after_frac) / len(after_frac)
-        variance_score = max(0, (1.0 - var * 4) * 100)
-
-        # ─── Component 2: Cosine alignment (directional match) ───
-        node_free = node.free_frac()
-        pod_frac = [
-            pod.req[i] / node.capacity[i] if node.capacity[i] > 0 else 0
-            for i in range(N_DIMS)
-        ]
-        nf = [node_free[i] for i in active_dims]
-        pf = [pod_frac[i] for i in active_dims]
-        alignment = cosine_sim(nf, pf)
-        alignment_score = alignment * 100
-
-        # ─── Component 3: Headroom (don't over-pack one node) ───
-        headroom = sum(nf) / len(nf)
-        headroom_score = headroom * 100
-
-        # ─── Component 4: Pressure gate (hard penalty near exhaustion) ───
-        pressure = 0
-        for i in active_dims:
-            used_after = (node.used[i] + pod.req[i]) / node.capacity[i]
-            if used_after > 0.92:
-                pressure += (used_after - 0.92) * 500  # sharp cliff
-            elif used_after > 0.85:
-                pressure += (used_after - 0.85) * 50   # gentle slope
-
-        # ─── Component 5: Stranding penalty ───
-        # If placement would create a stranded dimension (one > 80%, another < 20%)
-        strand_penalty = 0
-        for i in range(len(active_dims)):
-            for j in range(i + 1, len(active_dims)):
-                ui = after_frac[i]
-                uj = after_frac[j]
-                if (ui > 0.80 and uj < 0.20) or (uj > 0.80 and ui < 0.20):
-                    strand_penalty += 15
-
-        raw = (w_var * variance_score +
-               w_align * alignment_score +
-               w_headroom * headroom_score -
-               pressure - strand_penalty)
-
-        return max(0, min(100, raw))
-
-    return sc_lambda_g_v3
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -341,7 +270,6 @@ def eval_strategy(name, score_fn, seed=42):
     total_stranded = 0
     total_waste = 0
     total_pending = 0
-    wins = 0  # not used here, just aggregates
 
     results = {}
     for sc in SCENARIOS:
@@ -367,105 +295,31 @@ def eval_strategy(name, score_fn, seed=42):
 
 def main():
     print(f"""
-◊═══════════════════════════════════════════════════════════════════════════════◊
-  LAMBDA-G V3 — WEIGHT SEARCH + FULL BENCHMARK
-  φ = {PHI}
-◊═══════════════════════════════════════════════════════════════════════════════◊
+═══════════════════════════════════════════════════════════════════════════════
+  CLUSTER SCHEDULING BASELINE COMPARISON
+  6-dimensional workloads: {', '.join(DIM_NAMES)}
+═══════════════════════════════════════════════════════════════════════════════
 """)
-
-    # ─── Phase 1: Grid search over weight combinations ───
-    print("=" * 75)
-    print(" PHASE 1: Weight Grid Search")
-    print(" Finding optimal (w_var, w_align, w_headroom) combination")
-    print("=" * 75)
-
-    # Also evaluate baselines
-    baselines = [
-        ("LeastAllocated", sc_least_alloc),
-        ("MostAllocated", sc_most_alloc),
-        ("BalancedAllocation", sc_balanced),
-        ("DominantResource", sc_dominant),
-    ]
-
-    baseline_results = {}
-    for name, fn in baselines:
-        baseline_results[name] = eval_strategy(name, fn)
-
-    print(f"\n  Baselines:")
-    print(f"  {'Strategy':<25} {'Avg Bal':>8} {'Stranded':>9} {'Waste $':>10} {'Pending':>8}")
-    print(f"  {'─' * 62}")
-    for name in baseline_results:
-        r = baseline_results[name]
-        print(f"  {name:<25} {r['avg_balance']:>8.1f} {r['total_stranded']:>9} ${r['total_waste']:>9.0f} {r['total_pending']:>8}")
-
-    bal_balance = baseline_results["BalancedAllocation"]["avg_balance"]
-    bal_stranded = baseline_results["BalancedAllocation"]["total_stranded"]
-
-    # Grid search
-    print(f"\n  Searching weight space...")
-    print(f"  Target: beat BalancedAllocation (avg_balance={bal_balance}, stranded={bal_stranded})")
-    print()
-
-    best = None
-    best_score = -1
-    all_candidates = []
-
-    for w_var_10 in range(3, 9):          # 0.3 to 0.8
-        for w_align_10 in range(1, 6):    # 0.1 to 0.5
-            for w_head_10 in range(0, 4):  # 0.0 to 0.3
-                w_var = w_var_10 / 10.0
-                w_align = w_align_10 / 10.0
-                w_head = w_head_10 / 10.0
-
-                # Normalize
-                total_w = w_var + w_align + w_head
-                if total_w < 0.01:
-                    continue
-
-                fn = make_lambda_g_v3(w_var, w_align, w_head)
-                r = eval_strategy("test", fn)
-
-                # Score: balance matters most, then stranded, then waste
-                composite = (r['avg_balance'] * 2
-                             - r['total_stranded'] * 0.5
-                             - r['total_waste'] / 10000)
-
-                all_candidates.append((w_var, w_align, w_head, r, composite))
-
-                if composite > best_score:
-                    best_score = composite
-                    best = (w_var, w_align, w_head, r)
-
-    # Sort by composite score, show top 10
-    all_candidates.sort(key=lambda x: -x[4])
-
-    print(f"  {'Rank':<5} {'w_var':>6} {'w_aln':>6} {'w_hd':>6} {'Bal':>7} {'Str':>5} {'Waste':>9} {'Pend':>6} {'Comp':>8}")
-    print(f"  {'─' * 65}")
-    for rank, (wv, wa, wh, r, comp) in enumerate(all_candidates[:10], 1):
-        print(f"  {rank:<5} {wv:>6.1f} {wa:>6.1f} {wh:>6.1f} {r['avg_balance']:>7.1f} {r['total_stranded']:>5} ${r['total_waste']:>8.0f} {r['total_pending']:>6} {comp:>8.1f}")
-
-    w_v, w_a, w_h, best_r = best
-    print(f"\n  ★ Best weights: w_var={w_v}, w_align={w_a}, w_headroom={w_h}")
-    print(f"    Avg Balance: {best_r['avg_balance']} (BalancedAlloc: {bal_balance})")
-    print(f"    Stranded: {best_r['total_stranded']} (BalancedAlloc: {bal_stranded})")
-
-    beats_bal = best_r['avg_balance'] > bal_balance
-    print(f"\n    {'✅ BEATS' if beats_bal else '❌ LOSES TO'} BalancedAllocation on avg balance")
-
-    # ─── Phase 2: Full benchmark with best weights ───
-    print(f"\n{'=' * 75}")
-    print(f" PHASE 2: Full Benchmark — Best V3 vs All Strategies")
-    print(f"{'=' * 75}")
 
     strategies = [
         ("LeastAllocated",     sc_least_alloc),
         ("MostAllocated",      sc_most_alloc),
-        ("BalancedAllocation", sc_balanced),
-        ("DominantResource",   sc_dominant),
-        (f"Lambda-G V3 ({w_v}/{w_a}/{w_h})", make_lambda_g_v3(w_v, w_a, w_h)),
+        ("BalancedAllocation",  sc_balanced),
+        ("DominantResource",    sc_dominant),
     ]
-    short = ["LeastAll", "MostAll", "BalAlloc", "DomRes", "LG-V3"]
+    short = ["LeastAll", "MostAll", "BalAlloc", "DomRes"]
 
+    # ─── Aggregate summary ───
+    print(f"  {'Strategy':<25} {'Avg Bal':>8} {'Stranded':>9} {'Waste $':>10} {'Pending':>8}")
+    print(f"  {'─' * 62}")
+
+    agg = {}
+    for name, fn in strategies:
+        agg[name] = eval_strategy(name, fn)
+        r = agg[name]
+        print(f"  {name:<25} {r['avg_balance']:>8.1f} {r['total_stranded']:>9} ${r['total_waste']:>9.0f} {r['total_pending']:>8}")
+
+    # ─── Per-scenario breakdown ───
     all_results = {}
     for sc in SCENARIOS:
         print(f"\n  ── {sc['name']} ──")
@@ -482,7 +336,7 @@ def main():
         for s in short:
             print(f" {s:>10}", end="")
         print()
-        print(f"  {'─' * 70}")
+        print(f"  {'─' * 60}")
 
         for key, label, hb in [
             ('balance', 'Balance', True), ('stranded', 'Stranded', False),
@@ -491,23 +345,23 @@ def main():
             best_v = max(vals) if hb else min(vals)
             print(f"  {label:<18}", end="")
             for v in vals:
-                m = " ★" if v == best_v and vals.count(best_v) == 1 else "  "
+                m = " *" if v == best_v and vals.count(best_v) == 1 else "  "
                 if key == 'waste':
                     print(f" ${v:>8.0f}{m}", end="")
                 else:
                     print(f" {v:>9}{m}", end="")
             print()
 
-    # Grand summary
-    print(f"\n{'═' * 85}")
+    # ─── Grand summary ───
+    print(f"\n{'=' * 75}")
     print(f" GRAND SUMMARY")
-    print(f"{'═' * 85}\n")
+    print(f"{'=' * 75}\n")
 
     print(f"  {'Scenario':<35}", end="")
     for s in short:
         print(f" {s:>9}", end="")
     print(f" {'Winner':>13}")
-    print(f"  {'─' * 95}")
+    print(f"  {'─' * 85}")
 
     wins = {n: 0 for n, _ in strategies}
     tw = {n: 0 for n, _ in strategies}
@@ -522,11 +376,11 @@ def main():
             ts[n] += res[n]['stranded']
         print(f"  {sn:<35}", end="")
         for n, _ in strategies:
-            m = " ★" if n == w else "  "
+            m = " *" if n == w else "  "
             print(f" {scores[n]:>7.1f}{m}", end="")
-        print(f"  {w.split('(')[0].strip():>11}")
+        print(f"  {w:>11}")
 
-    print(f"\n  {'─' * 95}")
+    print(f"\n  {'─' * 85}")
     print(f"  {'Wins':<35}", end="")
     for n, _ in strategies:
         print(f" {wins[n]:>9}", end="")
@@ -540,19 +394,15 @@ def main():
         print(f" ${tw[n]:>8.0f}", end="")
     print()
 
-    lg_name = strategies[4][0]
-    ba_name = strategies[2][0]
-
     print(f"""
-◊═══════════════════════════════════════════════════════════════════════════════◊
-  VERDICT
-  Lambda-G V3 wins: {wins[lg_name]}/5
-  BalancedAllocation wins: {wins[ba_name]}/5
-  Lambda-G V3 total stranded: {ts[lg_name]} (BalAlloc: {ts[ba_name]})
-  Lambda-G V3 total waste: ${tw[lg_name]:.0f} (BalAlloc: ${tw[ba_name]:.0f})
-  Best weights: w_var={w_v}  w_align={w_a}  w_headroom={w_h}
-  φ = {PHI}
-◊═══════════════════════════════════════════════════════════════════════════════◊
+═══════════════════════════════════════════════════════════════════════════════
+  NOTE: These are baseline K8s strategies only. None of them account for
+  multi-dimensional resource alignment (cosine similarity between pod
+  request vectors and node free-space vectors).
+
+  For Lambda-G scoring results, see the design proposals at:
+    https://github.com/kai-scheduler/KAI-Scheduler/pull/1374
+═══════════════════════════════════════════════════════════════════════════════
 """)
 
 
