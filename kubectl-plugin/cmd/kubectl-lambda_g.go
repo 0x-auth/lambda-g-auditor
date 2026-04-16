@@ -7,6 +7,7 @@ import (
 
 	"github.com/0x-auth/lambda-g-auditor/pkg"
 	"k8s.io/client-go/kubernetes"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
